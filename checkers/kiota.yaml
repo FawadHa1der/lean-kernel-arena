@@ -11,4 +11,5 @@ rev: 2d2a9fa31cba31abdd49543c3bb667591207577e
 declines:
   - cslib
 build: cargo build --release
-run: timeout 3600s ./target/release/kiota "$IN"
+run: ./target/release/kiota "$IN"
+timeout: 3600
