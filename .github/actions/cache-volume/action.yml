@@ -1,0 +1,15 @@
+name: Mount cache volume
+description: |
+  Mounts the Namespace cache volume's directories over ~/.cache (the test
+  export cache of `lka.py build-test --cache`, the Mathlib cache) and ~/.elan
+  (toolchains). The job must run on a `-with-cache` Namespace runner with a
+  cache tag; which refs may write the volume back is set there too.
+runs:
+  using: composite
+  steps:
+    - name: Mount cache directories
+      uses: namespacelabs/nscloud-cache-action@v1
+      with:
+        path: |
+          ~/.cache
+          ~/.elan

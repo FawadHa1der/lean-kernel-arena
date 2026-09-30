@@ -13,9 +13,11 @@ import argparse
 import datetime
 import filecmp
 import fnmatch
+import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -54,6 +56,11 @@ VERBOSE = False
 # Tests with .ndjson files larger than this are excluded from the downloadable
 # test tarball.
 TEST_SIZE_LIMIT = 10 * 1024 * 1024
+
+# Part of the cache key of every cached test export (see `test_cache_key`).
+# Bump it to invalidate all cached exports, e.g. when lean4export or the way
+# tests are exported changes.
+TEST_CACHE_VERSION = 1
 
 # The canonical location of the published site. Used for the "other rounds"
 # link, which has to be absolute: archived rounds are served from
@@ -163,7 +170,9 @@ def format_relative_perf(current: float, baseline: float) -> str:
 
 def format_instructions(instruction_count: int) -> str:
     """Format instruction count to a human-readable string with SI prefixes."""
-    if instruction_count >= 1_000_000_000:
+    if instruction_count >= 1_000_000_000_000:
+        return f"{instruction_count / 1_000_000_000_000:.1f}\u202fT"
+    elif instruction_count >= 1_000_000_000:
         return f"{instruction_count / 1_000_000_000:.1f}\u202fG"
     elif instruction_count >= 1_000_000:
         return f"{instruction_count / 1_000_000:.1f}\u202fM"
@@ -224,12 +233,64 @@ def extract_ndjson_metadata(ndjson_file: Path) -> dict:
     return metadata
 
 
+def _run_process(
+    cmd: str | list[str],
+    cwd: Path | None = None,
+    env: dict | None = None,
+    shell: bool = False,
+    capture_output: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    """Like subprocess.run, but with a timeout that kills the whole process group.
+
+    With a timeout, the command is started in a new session, so that on timeout
+    not only the direct child (which may be a `perf`/`time` wrapper or a shell)
+    but also everything it spawned is killed. The returned CompletedProcess has
+    an additional `timed_out` attribute.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        shell=shell,
+        stdout=subprocess.PIPE if capture_output else None,
+        stderr=subprocess.PIPE if capture_output else None,
+        text=True,
+        # Only detach from our process group when we need to kill the group
+        # ourselves; otherwise Ctrl-C would no longer reach the child.
+        start_new_session=timeout is not None,
+    )
+
+    def kill_group():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    timed_out = False
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        kill_group()
+        stdout, stderr = proc.communicate()
+    except KeyboardInterrupt:
+        # In a new session the child does not see the terminal's SIGINT
+        if timeout is not None:
+            kill_group()
+        raise
+    result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+    result.timed_out = timed_out
+    return result
+
+
 def measure_perf_with_fallback(
     cmd: str | list[str],
     cwd: Path | None = None,
     env: dict | None = None,
     shell: bool = False,
     capture_output: bool = True,
+    timeout: float | None = None,
 ) -> tuple[subprocess.CompletedProcess, dict]:
     """Run a command and measure performance metrics using perf + GNU time, with fallback.
 
@@ -241,6 +302,9 @@ def measure_perf_with_fallback(
     - cpu_time: CPU time in seconds (measured via perf task-clock)
     - max_rss: Maximum RSS in bytes (measured via GNU time)
     - instructions: Instruction count (measured via perf)
+
+    If `timeout` (in seconds) is given and exceeded, the command is killed and
+    the result has `timed_out` set to True.
     """
     # Record wall time manually as fallback
     start_wall_time = time.time()
@@ -296,13 +360,13 @@ def measure_perf_with_fallback(
             perf_env["LC_ALL"] = "C"  # Ensure perf outputs valid JSON
 
             # Run with nested perf + time
-            result = subprocess.run(
+            result = _run_process(
                 full_cmd,
                 cwd=cwd,
                 env=perf_env,
                 shell=False,
                 capture_output=capture_output,
-                text=True,
+                timeout=timeout,
             )
 
             # Parse perf output
@@ -375,13 +439,13 @@ def measure_perf_with_fallback(
 
     if not use_perf:
         # Final fallback: run normally and measure wall time only
-        result = subprocess.run(
+        result = _run_process(
             cmd,
             cwd=cwd,
             env=env,
             shell=shell,
             capture_output=capture_output,
-            text=True,
+            timeout=timeout,
         )
         metrics["wall_time"] = time.time() - start_wall_time
         metrics["cpu_time"] = 0.0  # Not measured here
@@ -399,6 +463,7 @@ def run_cmd(
     capture_output: bool = True,
     measure_perf: bool = False,
     print_on_failure: bool = False,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a command with optional verbose output and performance measurement.
 
@@ -410,6 +475,7 @@ def run_cmd(
         capture_output: Whether to capture stdout/stderr
         measure_perf: Whether to measure detailed performance metrics
         print_on_failure: Whether to print stdout/stderr when the command fails
+        timeout: Kill the command (and its process group) after this many seconds
 
     Returns:
         CompletedProcess instance with additional attributes:
@@ -417,6 +483,7 @@ def run_cmd(
         - cpu_time: CPU time in seconds (if available)
         - max_rss: Maximum RSS in bytes (if available)
         - instructions: Instruction count (if available)
+        - timed_out: Whether the command was killed due to the timeout
     """
     global VERBOSE
 
@@ -433,7 +500,7 @@ def run_cmd(
     if measure_perf:
         # Use detailed performance measurement
         result, metrics = measure_perf_with_fallback(
-            cmd, cwd=cwd, env=env, shell=shell, capture_output=capture_output
+            cmd, cwd=cwd, env=env, shell=shell, capture_output=capture_output, timeout=timeout
         )
 
         # Add metrics as attributes to the result
@@ -443,7 +510,10 @@ def run_cmd(
         result.instructions = metrics.get("instructions", 0)
 
         if VERBOSE:
-            status = "ok" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
+            if result.timed_out:
+                status = f"TIMEOUT (after {format_duration(timeout)})"
+            else:
+                status = "ok" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
             metrics_str = f"wall: {format_duration(result.wall_time)}"
             # Show real CPU time from perf (task-clock), not converted from instructions
             if result.cpu_time > 0:
@@ -457,13 +527,13 @@ def run_cmd(
         # Use simple timing
         start_time = time.time()
 
-        result = subprocess.run(
+        result = _run_process(
             cmd,
             cwd=cwd,
             env=env,
             shell=shell,
             capture_output=capture_output,
-            text=True,
+            timeout=timeout,
         )
 
         elapsed = time.time() - start_time
@@ -475,7 +545,10 @@ def run_cmd(
         result.instructions = 0  # Not measured
 
         if VERBOSE:
-            status = "ok" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
+            if result.timed_out:
+                status = f"TIMEOUT (after {format_duration(timeout)})"
+            else:
+                status = "ok" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
             print(f"      -> {status} in {format_duration(elapsed)}")
 
     if VERBOSE:
@@ -612,7 +685,8 @@ def load_yaml_files(directory: Path, schema_name: str) -> list[dict]:
         """Derive a checker version string.
 
         If the checker YAML omits `version` but has both `ref` and `rev`, use
-        "<ref> (<first 7 of rev>)".
+        "<ref> (<first 7 of rev>)". For the default branch (master/main) the
+        branch name carries no information, so just use the short revision.
         """
         version = config.get("version")
         if isinstance(version, str) and version.strip():
@@ -620,11 +694,16 @@ def load_yaml_files(directory: Path, schema_name: str) -> list[dict]:
 
         ref = config.get("ref")
         rev = config.get("rev")
-        if isinstance(ref, str) and ref.strip() and isinstance(rev, str) and rev.strip():
-            rev_short = rev.strip()[:7]
-            return f"{ref.strip()} ({rev_short})"
+        if not (isinstance(rev, str) and rev.strip()):
+            return None
+        rev_short = rev.strip()[:7]
 
-        return None
+        if not (isinstance(ref, str) and ref.strip()):
+            return rev_short
+        ref = ref.strip()
+        if ref in ("master", "main"):
+            return rev_short
+        return f"{ref} ({rev_short})"
 
     # Sort files alphabetically to avoid dependency on filesystem order
     # Search recursively so tests can be organized in subdirectories
@@ -747,7 +826,25 @@ def setup_source_directory(
 
     src_dir = work_dir / "src"
 
-    if url:
+    if url and rev:
+        # Fetch just the pinned revision, without the history of the repository
+        # (GitHub serves any commit by its hash). This still gives a git checkout
+        # with an `origin` remote, which some builds rely on: Mathlib's
+        # `lake exe cache get` asks git for the remote and the current commit.
+        print(f"  Fetching {url} at {rev}...")
+        src_dir.mkdir()
+        for cmd in (["git", "init", "--quiet"],
+                    ["git", "remote", "add", "origin", url],
+                    ["git", "fetch", "--depth", "1", "origin", rev],
+                    ["git", "checkout", "--quiet", "FETCH_HEAD"]):
+            result = run_cmd(cmd, cwd=src_dir)
+            if result.returncode != 0:
+                print(f"  Error running {' '.join(cmd)}: {result.stderr}")
+                return None
+
+        return src_dir
+
+    elif url:
         # Clone from git repository
         print(f"  Cloning {url}...")
         clone_cmd = ["git", "clone"]
@@ -759,13 +856,6 @@ def setup_source_directory(
         if result.returncode != 0:
             print(f"  Error cloning: {result.stderr}")
             return None
-
-        # Checkout specific revision if specified
-        if rev:
-            result = run_cmd(["git", "checkout", rev], cwd=src_dir)
-            if result.returncode != 0:
-                print(f"  Error checking out {rev}: {result.stderr}")
-                return None
 
         return src_dir
 
@@ -826,22 +916,104 @@ name = "Test"'''
 
 
 def _gather_ndjson_stats(ndjson_file: Path) -> dict:
-    """Gather size, line count, and metadata from an NDJSON file."""
+    """Gather size, line count, hash, and metadata from an NDJSON file."""
     file_size = ndjson_file.stat().st_size
-    with open(ndjson_file, "r") as f:
-        line_count = sum(1 for _ in f)
+    # Line count and hash in one pass; exports can be large. The hash is
+    # only recorded in results.json, to pin down which export was checked.
+    line_count = 0
+    sha256 = hashlib.sha256()
+    last = b"\n"
+    with open(ndjson_file, "rb") as f:
+        while chunk := f.read(1 << 20):
+            line_count += chunk.count(b"\n")
+            sha256.update(chunk)
+            last = chunk[-1:]
+    if last != b"\n":
+        # A final line without a trailing newline counts as well
+        line_count += 1
     metadata = extract_ndjson_metadata(ndjson_file)
     return {
         "size": file_size,
         "size_str": format_memory(file_size),
         "lines": line_count,
         "lines_str": format_unitless(line_count),
+        "sha256": sha256.hexdigest(),
         **metadata,
     }
 
 
-def create_test(test: dict, output_dir: Path) -> bool:
-    """Create a single test."""
+def test_cache_key(test: dict) -> str | None:
+    """The key under which the export of a test is cached, or None if the
+    test cannot be cached.
+
+    Only tests whose export is fully determined by their description can be
+    cached: those fetched from a repository at a pinned revision, without any
+    local sources. Their key is computed from the description alone (the
+    whole YAML file), so a cache hit needs neither the sources nor the
+    toolchain. What the key cannot see, such as the version of lean4export
+    used, is covered by `TEST_CACHE_VERSION`. The revision is part of the key
+    only to make cache entries easier to tell apart.
+    """
+    if not (test.get("url") and test.get("rev")) or test.get("multiple"):
+        return None
+    yaml_file = get_project_root() / "tests" / f"{test['name']}.yaml"
+    digest = hashlib.sha256(yaml_file.read_bytes()).hexdigest()
+    return f"{test['rev'][:12]}-v{TEST_CACHE_VERSION}-{digest[:16]}"
+
+
+def get_default_test_cache_dir() -> Path:
+    """The default location of the test export cache (see `build-test --cache`)."""
+    cache_home = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    return Path(cache_home) / "lean-kernel-arena" / "tests"
+
+
+def restore_cached_test(name: str, key: str, cache_dir: Path, output_file: Path) -> dict | None:
+    """Link the cached export of a test to `output_file`, returning its cached
+    statistics, or None if it is not cached."""
+    cached = cache_dir / name / f"{key}.ndjson"
+    cached_stats = cache_dir / name / f"{key}.stats.json"
+    if not (cached.exists() and cached_stats.exists()):
+        return None
+    try:
+        with open(cached_stats) as f:
+            stats = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"  Warning: ignoring unreadable cache entry {cached_stats}: {e}")
+        return None
+    # A symbolic link, as the cache may well be on another file system, and
+    # copying the larger exports would take a while
+    output_file.unlink(missing_ok=True)
+    output_file.symlink_to(cached)
+    print(f"  Using cached export {cached}")
+    return stats
+
+
+def store_cached_test(name: str, key: str, cache_dir: Path, output_file: Path, stats: dict) -> None:
+    """Put the export of a test and its statistics into the cache, replacing
+    any other cached export of the same test."""
+    entry_dir = cache_dir / name
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    # Write under temporary names first, so that an interrupted write leaves
+    # no entry behind that looks complete
+    tmp = entry_dir / f"{key}.ndjson.tmp"
+    shutil.copyfile(output_file, tmp)
+    with open(entry_dir / f"{key}.stats.json.tmp", "w") as f:
+        json.dump(stats, f, indent=2)
+    for old in entry_dir.iterdir():
+        if old.name.split(".", 1)[0] != key:
+            old.unlink()
+    tmp.rename(entry_dir / f"{key}.ndjson")
+    (entry_dir / f"{key}.stats.json.tmp").rename(entry_dir / f"{key}.stats.json")
+    print(f"  Cached export as {entry_dir / key}.ndjson")
+
+
+def create_test(test: dict, output_dir: Path, cache_dir: Path | None = None) -> bool:
+    """Create a single test.
+
+    With `cache_dir`, the export of a test that can be cached (see
+    `test_cache_key`) is taken from there if present, and stored there after
+    it was built otherwise.
+    """
     name = test["name"]
     module = test.get("module")
     run_cmd_str = test.get("run")
@@ -883,8 +1055,15 @@ def create_test(test: dict, output_dir: Path) -> bool:
         # Ensure parent directories exist (for tests in subdirectories like perf/)
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
+    cache_key = test_cache_key(test)
+    cached_stats = None
+    if cache_dir is not None and cache_key is not None:
+        cached_stats = restore_cached_test(name, cache_key, cache_dir, output_file)
+
     # Produce .ndjson file(s) based on test type
-    if file_path:
+    if cached_stats is not None:
+        pass  # restored from the cache above
+    elif file_path:
         # Static file case (no work directory needed)
         if multiple:
             print(f"  Error: Test {name} cannot use 'multiple' flag with static file")
@@ -1019,6 +1198,8 @@ def create_test(test: dict, output_dir: Path) -> bool:
             stats["name"] = f"{name}/{subtest_name}"
             stats["outcome"] = "accept" if outcome == "good" else "reject"
             stats["yaml_file"] = f"tests/{name}.yaml"
+            if test.get("timeout"):
+                stats["timeout"] = test["timeout"]
 
             # Generate and store source links from parent test
             stats.update(generate_source_links(test, "tests", build_info.get("git_revision")))
@@ -1048,9 +1229,19 @@ def create_test(test: dict, output_dir: Path) -> bool:
 
     else:
         # Single test: move tmp file to final location and gather stats
-        tmp_file.rename(output_file)
-
-        stats = _gather_ndjson_stats(output_file)
+        if cached_stats is not None:
+            stats = cached_stats
+        else:
+            output_file.unlink(missing_ok=True)
+            tmp_file.rename(output_file)
+            stats = _gather_ndjson_stats(output_file)
+            if cache_dir is not None and cache_key is not None:
+                store_cached_test(name, cache_key, cache_dir, output_file, stats)
+        # Everything below comes from the test description, not the export, so
+        # it is added afresh even to cached statistics
+        stats = dict(stats)
+        if cache_key is not None:
+            stats["cache_key"] = cache_key
         stats["name"] = name
         stats["yaml_file"] = f"tests/{name}.yaml"
         stats["outcome"] = test.get("outcome")
@@ -1068,6 +1259,10 @@ def create_test(test: dict, output_dir: Path) -> bool:
         # Add skip-on-ci field if present
         if test.get("skip-on-ci"):
             stats["skip-on-ci"] = test["skip-on-ci"]
+
+        # Add timeout field if present
+        if test.get("timeout"):
+            stats["timeout"] = test["timeout"]
 
         # Generate and store source links
         build_info = get_build_metadata()
@@ -1123,10 +1318,15 @@ def cmd_build_test(args: argparse.Namespace) -> int:
         print("No tests found.")
         return 0
 
+    cache_dir = None
+    if args.cache is not None:
+        cache_dir = Path(args.cache) if args.cache else get_default_test_cache_dir()
+        print(f"Using the test export cache in {cache_dir}")
+
     success = 0
     failed = 0
     for test in tests:
-        if create_test(test, output_dir):
+        if create_test(test, output_dir, cache_dir):
             success += 1
         else:
             failed += 1
@@ -1289,10 +1489,16 @@ def run_checker_on_test(checker: dict, test: dict, build_dir: Path, tests_dir: P
     env = os.environ.copy()
     env["IN"] = str(test_file)
 
-    result = run_cmd(checker_run_cmd, cwd=work_dir, shell=True, env=env, measure_perf=True)
+    # Kill the checker if it exceeds the test's or its own timeout (if any)
+    timeouts = [t for t in (test.get("timeout"), checker.get("timeout")) if t is not None]
+    timeout = min(timeouts) if timeouts else None
+
+    result = run_cmd(checker_run_cmd, cwd=work_dir, shell=True, env=env, measure_perf=True, timeout=timeout)
 
     exit_code = result.returncode
-    if exit_code == 0:
+    if result.timed_out:
+        status = "timeout"
+    elif exit_code == 0:
         status = "accepted"
     elif exit_code == 1:
         status = "rejected"
@@ -1305,7 +1511,7 @@ def run_checker_on_test(checker: dict, test: dict, build_dir: Path, tests_dir: P
     expected_outcome = test.get("outcome")
     if status == "declined":
         correctness = "declined"
-    elif status == "error":
+    elif status == "error" or status == "timeout":
         correctness = "error"
     elif expected_outcome == "either":
         # Not settled whether a checker should accept or reject this: both
@@ -1331,6 +1537,13 @@ def run_checker_on_test(checker: dict, test: dict, build_dir: Path, tests_dir: P
         "stdout": result.stdout,
         "stderr": result.stderr,
     }
+    if timeout is not None:
+        result_data["timeout"] = timeout
+    if result.timed_out:
+        result_data["stderr"] = (
+            f"Killed after exceeding the timeout of {format_duration(timeout)}.\n"
+            + (result.stderr or "")
+        )
 
     # Write result to JSON file (replace "/" with "_" for valid filename)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -1402,6 +1615,8 @@ def cmd_run_checker(args: argparse.Namespace) -> int:
                 status_emoji = '👎'
             elif status == 'declined':
                 status_emoji = '⊘'
+            elif status == 'timeout':
+                status_emoji = '⌛'
             else:  # error
                 status_emoji = '⚠️'
             
@@ -1590,9 +1805,9 @@ def compute_checker_stats(checker: dict, tests: list[dict], results: dict) -> di
             mathlib_max_rss = result.get("max_rss")
             mathlib_instructions = result.get("instructions", 0) or 0
 
-        # Count declined and error tests
+        # Count declined, error and timed out tests
         # Errors don't make any assertion about correctness, so treat them like declines
-        if status == "declined" or status == "error":
+        if status in ("declined", "error", "timeout"):
             declined_count += 1
             if expected_outcome == "accept":
                 accept_declined += 1
@@ -1650,8 +1865,8 @@ def get_build_metadata() -> dict:
         "github_action_url": None,
         # Round metadata, filled in by build-site from its --round/--doi/
         # --zenodo-deposition options. A build without a round name is the
-        # ongoing round ("Round in progress"); only a release build off a
-        # round-* tag names a round and carries a DOI.
+        # ongoing round ("Round in progress"); only the release-round
+        # workflow names a round and gives it a DOI.
         "round": None,
         "doi": None,
         "zenodo_deposition": None,
@@ -1763,7 +1978,8 @@ def create_test_tarball(tests: list, output_dir: Path) -> dict:
     good_count = 0
     bad_count = 0
 
-    with tarfile.open(tarball_path, "w:gz") as tar:
+    # Cached exports are symbolic links into the cache (see `build-test --cache`)
+    with tarfile.open(tarball_path, "w:gz", dereference=True) as tar:
         for test in tests:
             # Skip tests larger than the size limit
             if test.get("size", 0) > TEST_SIZE_LIMIT:
@@ -1841,6 +2057,48 @@ def result_virtual_time(result: dict, instructions_per_second: float) -> float:
     if instructions > 0 and instructions_per_second > 0:
         return instructions / instructions_per_second
     return result.get("cpu_time") or 0
+
+
+def format_perf_tooltip(virtual_time: float | None = None, instructions: int = 0,
+                        wall_time: float | None = None, prefix: str | None = None) -> str:
+    """Tooltip text for a cell showing a performance figure, spelling out the
+    numbers behind it: the virtual CPU time, the instruction count it is
+    derived from, and the measured wall clock time. Numbers that are unknown
+    (or not interesting, such as the virtual time in a cell that shows it
+    already) are left out."""
+    parts = [prefix] if prefix else []
+    if virtual_time:
+        parts.append(f"virtual time: {format_duration(virtual_time)}")
+    if instructions:
+        parts.append(f"instructions: {format_instructions(instructions)}")
+    if wall_time:
+        parts.append(f"wall time: {format_duration(wall_time)}")
+    return "\n".join(parts)
+
+
+def result_perf_tooltip(result: dict, instructions_per_second: float,
+                        virtual_time: bool = False, prefix: str | None = None) -> str:
+    """Tooltip for a cell showing a performance figure of a single result.
+    Cells that display the virtual time itself pass virtual_time=False; cells
+    that show a relative figure pass virtual_time=True to include it."""
+    return format_perf_tooltip(
+        result_virtual_time(result, instructions_per_second) if virtual_time else None,
+        result.get("instructions") or 0,
+        result.get("wall_time"),
+        prefix,
+    )
+
+
+def outcome_matches(expected: str | None, status: str | None) -> bool:
+    """Whether a checker's result is the outcome the test expects.
+
+    Performance is only comparable between checkers that agree on the outcome,
+    for rejections as much as for acceptances: a checker that rejects a test
+    the moment it should has done the work the test measures. Tests with
+    outcome 'either' have no settled expectation and never match.
+    """
+    return ((expected == "accept" and status == "accepted")
+            or (expected == "reject" and status == "rejected"))
 
 
 def group_rows(members: list, name_of) -> list[dict]:
@@ -2007,6 +2265,8 @@ def make_template_env(templates_dir: Path) -> Environment:
         autoescape=select_autoescape(),
     )
     env.globals["rounds_url"] = ROUNDS_URL
+    env.globals["format_perf_tooltip"] = format_perf_tooltip
+    env.globals["result_perf_tooltip"] = result_perf_tooltip
     return env
 
 
@@ -2022,6 +2282,7 @@ def cmd_build_site(args: argparse.Namespace) -> int:
 
     env = make_template_env(templates_dir)
     env.globals["format_relative_perf"] = format_relative_perf
+    env.globals["outcome_matches"] = outcome_matches
 
     # The site is rendered from the results.json data structure, either read
     # from a previously written file (--results) or collected now.
@@ -2101,7 +2362,7 @@ def cmd_build_site(args: argparse.Namespace) -> int:
         times = {}
         for checker in checkers:
             result = results.get((checker["name"], test["name"]))
-            if result and result.get("status") == "accepted":
+            if result and outcome_matches(test.get("outcome"), result.get("status")):
                 time = result_virtual_time(result, instructions_per_second)
                 if time > 0:
                     times[checker["name"]] = time
@@ -2245,17 +2506,29 @@ def cmd_build_site(args: argparse.Namespace) -> int:
                 row["count"] = len(row["members"])
                 row.update(summarize_correctness(row["members"]))
                 row["time_sum"] = sum(result_virtual_time(r, instructions_per_second) for r in row["members"])
+                row["instructions_sum"] = sum(r.get("instructions") or 0 for r in row["members"])
+                row["wall_time_sum"] = sum(r.get("wall_time") or 0 for r in row["members"])
                 row["rss_max"] = max(r.get("max_rss") or 0 for r in row["members"])
                 # Overall performance relative to the official checker, summed
-                # over the tests that both checkers accepted
+                # over the perf-compared tests where both checkers gave the
+                # expected outcome
                 own_time = 0.0
+                own_instructions = 0
+                own_wall_time = 0.0
                 official_time = 0.0
                 for r in row["members"]:
                     official = r.get("official")
-                    if (r.get("expected") == "accept" and r.get("status") == "accepted"
-                            and official and official.get("status") == "accepted"):
+                    if (r.get("test_stats", {}).get("compare-perf")
+                            and outcome_matches(r.get("expected"), r.get("status"))
+                            and official
+                            and outcome_matches(r.get("expected"), official.get("status"))):
                         own_time += result_virtual_time(r, instructions_per_second)
+                        own_instructions += r.get("instructions") or 0
+                        own_wall_time += r.get("wall_time") or 0
                         official_time += result_virtual_time(official, instructions_per_second)
+                row["perf_time_sum"] = own_time
+                row["perf_instructions_sum"] = own_instructions
+                row["perf_wall_time_sum"] = own_wall_time
                 if official_time > 0 and own_time > 0:
                     row["relative_perf"] = format_relative_perf(own_time, official_time)
                 else:
@@ -2484,6 +2757,15 @@ def main() -> int:
         "--skip-declined-by",
         metavar="CHECKER",
         help="Skip tests listed in the given checker's 'declines' field",
+    )
+    build_test_parser.add_argument(
+        "--cache",
+        nargs="?",
+        const="",
+        metavar="DIR",
+        help="Take the exports of tests fetched at a pinned revision from the "
+        "cache in DIR if present, and store them there otherwise (default DIR: "
+        "$XDG_CACHE_HOME/lean-kernel-arena/tests)",
     )
 
     # build-checker command
